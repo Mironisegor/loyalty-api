@@ -1,0 +1,235 @@
+asyncapi: 3.0.0
+info:
+  title: Loyalty events
+  version: 1.0.0
+  description: |
+    События сервиса лояльности. Доставка Kafka — «хотя бы один раз», поэтому:
+    - уровень сообщения: заголовок event_id, потребитель хранит обработанные event_id (processed_message);
+    - уровень бизнес-факта: для PurchaseCompleted — order_id (уникальный индекс ORDER + order_id в журнале);
+      для OrderRefunded — refund_id, для OrderDelivered — order_id, для UserRegistered — user_id (один счёт на клиента);
+      для публикуемых событий — operation_id (PointsAccrued) и referral_id (ReferralConverted).
+    Модель данных — 05_Ledger/Ledger.md.
+
+servers:
+  kafka:
+    host: kafka.platform.example:9092
+    protocol: kafka
+
+channels:
+  purchaseCompleted:
+    address: orders.purchase-completed
+    description: Публикует сервис заказов после подтверждения оплаты платёжным модулем
+    messages:
+      PurchaseCompleted:
+        $ref: '#/components/messages/PurchaseCompleted'
+  userRegistered:
+    address: auth.user-registered
+    description: Публикует сервис аутентификации после успешной регистрации клиента
+    messages:
+      UserRegistered:
+        $ref: '#/components/messages/UserRegistered'
+  orderDelivered:
+    address: orders.order-delivered
+    description: Публикует сервис заказов, когда клиент получил заказ
+    messages:
+      OrderDelivered:
+        $ref: '#/components/messages/OrderDelivered'
+  orderRefunded:
+    address: orders.order-refunded
+    description: Публикует сервис заказов после того, как платёжный модуль провёл возврат
+    messages:
+      OrderRefunded:
+        $ref: '#/components/messages/OrderRefunded'
+  pointsAccrued:
+    address: loyalty.points-accrued
+    description: Публикует сервис лояльности (через outbox)
+    messages:
+      PointsAccrued:
+        $ref: '#/components/messages/PointsAccrued'
+  referralConverted:
+    address: loyalty.referral-converted
+    description: Публикует сервис лояльности (через outbox)
+    messages:
+      ReferralConverted:
+        $ref: '#/components/messages/ReferralConverted'
+
+operations:
+  consumePurchaseCompleted:
+    action: receive
+    channel: { $ref: '#/channels/purchaseCompleted' }
+    summary: Начисление баллов в статусе PENDING; повтор по order_id не создаёт второе начисление
+  consumeUserRegistered:
+    action: receive
+    channel: { $ref: '#/channels/userRegistered' }
+    summary: Создание счёта; привязка приглашённого к пригласившему по referral_code или click_id
+  consumeOrderDelivered:
+    action: receive
+    channel: { $ref: '#/channels/orderDelivered' }
+    summary: Отсчёт 14 дней до активации баллов и до конверсии реферала
+  consumeOrderRefunded:
+    action: receive
+    channel: { $ref: '#/channels/orderRefunded' }
+    summary: Уменьшение или отмена начисления; отмена конверсии реферала; возврат баллов, оплаченных заказом
+  publishPointsAccrued:
+    action: send
+    channel: { $ref: '#/channels/pointsAccrued' }
+    summary: Начисление создано (PENDING) или баллы стали доступны (AVAILABLE)
+  publishReferralConverted:
+    action: send
+    channel: { $ref: '#/channels/referralConverted' }
+    summary: Реферал конвертирован, бонусы начислены обеим сторонам
+
+components:
+  messages:
+    PurchaseCompleted:
+      name: PurchaseCompleted
+      headers: { $ref: '#/components/schemas/EventHeaders' }
+      payload: { $ref: '#/components/schemas/PurchaseCompletedPayload' }
+      bindings:
+        kafka:
+          key: { type: string, description: user_id — все события клиента в одной партиции }
+    UserRegistered:
+      name: UserRegistered
+      headers: { $ref: '#/components/schemas/EventHeaders' }
+      payload: { $ref: '#/components/schemas/UserRegisteredPayload' }
+      bindings:
+        kafka:
+          key: { type: string, description: user_id }
+    OrderDelivered:
+      name: OrderDelivered
+      headers: { $ref: '#/components/schemas/EventHeaders' }
+      payload: { $ref: '#/components/schemas/OrderDeliveredPayload' }
+      bindings:
+        kafka:
+          key: { type: string, description: user_id }
+    OrderRefunded:
+      name: OrderRefunded
+      headers: { $ref: '#/components/schemas/EventHeaders' }
+      payload: { $ref: '#/components/schemas/OrderRefundedPayload' }
+      bindings:
+        kafka:
+          key: { type: string, description: user_id }
+    PointsAccrued:
+      name: PointsAccrued
+      headers: { $ref: '#/components/schemas/EventHeaders' }
+      payload: { $ref: '#/components/schemas/PointsAccruedPayload' }
+      bindings:
+        kafka:
+          key: { type: string, description: account_id }
+    ReferralConverted:
+      name: ReferralConverted
+      headers: { $ref: '#/components/schemas/EventHeaders' }
+      payload: { $ref: '#/components/schemas/ReferralConvertedPayload' }
+      bindings:
+        kafka:
+          key: { type: string, description: referral_id }
+
+  schemas:
+    EventHeaders:
+      type: object
+      required: [event_id, event_type, occurred_at]
+      properties:
+        event_id:
+          type: string
+          format: uuid
+          description: Идентификатор сообщения. Идемпотентность уровня сообщения, НЕ бизнес-факта
+        event_type: { type: string }
+        occurred_at: { type: string, format: date-time }
+
+    PurchaseCompletedPayload:
+      type: object
+      required: [order_id, user_id, paid_at, items, delivery_amount]
+      properties:
+        order_id:
+          type: string
+          description: Естественный ключ бизнес-факта. Начисление за один order_id создаётся один раз
+        user_id: { type: string }
+        paid_at:
+          type: string
+          format: date-time
+          description: Время оплаты. По нему выбирается версия правил и проверяется окно атрибуции реферала
+        items:
+          type: array
+          items:
+            type: object
+            required: [sku, category_code, is_stone, is_discount, paid_money_amount, paid_points_amount]
+            properties:
+              sku: { type: string }
+              category_code: { type: string }
+              is_stone: { type: boolean, description: Для лимита оплаты баллами 30% (RULE-PAY-01) }
+              is_discount: { type: boolean, description: Раздел «Дисконт» не входит в расчёт (RULE-EARN-02) }
+              paid_money_amount: { type: number, description: Оплачено деньгами, ₽ }
+              paid_points_amount: { type: integer, description: Оплачено баллами }
+        delivery_amount: { type: number, description: Не входит в расчёт баллов }
+        payment_instrument_hash: { type: string, nullable: true, description: Для проверки на накрутку (RULE-AA-03) }
+
+    UserRegisteredPayload:
+      type: object
+      required: [user_id, phone_hash, registered_at]
+      properties:
+        user_id: { type: string, description: Клиент платформы; по нему создаётся счёт }
+        phone_hash: { type: string, description: Хэш телефона для проверки на накрутку (RULE-AA-03); номер не передаётся }
+        referral_code: { type: string, nullable: true, description: Код приглашения, введённый при регистрации }
+        click_id: { type: string, format: uuid, nullable: true, description: Идентификатор перехода по ссылке приглашения }
+        registered_at: { type: string, format: date-time }
+
+    OrderDeliveredPayload:
+      type: object
+      required: [order_id, user_id, delivered_at]
+      properties:
+        order_id: { type: string, description: Номер заказа; ключ бизнес-факта }
+        user_id: { type: string }
+        delivered_at: { type: string, format: date-time, description: Время получения заказа; от него считаются 14 дней }
+
+    OrderRefundedPayload:
+      type: object
+      required: [refund_id, order_id, user_id, refund_type, items, refunded_at]
+      properties:
+        refund_id: { type: string, description: Идентификатор возврата; ключ бизнес-факта, у каждого частичного возврата свой }
+        order_id: { type: string }
+        user_id: { type: string }
+        refund_type: { type: string, enum: [FULL, PARTIAL] }
+        items:
+          type: array
+          description: Позиции возврата; по ним баллы уменьшаются пропорционально
+          items:
+            type: object
+            required: [sku, refunded_money_amount, refunded_points_amount]
+            properties:
+              sku: { type: string }
+              refunded_money_amount: { type: number, description: Возвращено деньгами, ₽ }
+              refunded_points_amount: { type: integer, description: Возвращено баллами }
+        refunded_at: { type: string, format: date-time }
+
+    PointsAccruedPayload:
+      type: object
+      required: [operation_id, account_id, user_id, source_type, source_id, amount, bucket, rules_version]
+      properties:
+        operation_id: { type: string, format: uuid, description: Ключ идемпотентности для потребителей }
+        account_id: { type: string, format: uuid }
+        user_id: { type: string }
+        source_type: { type: string, enum: [ORDER, REFERRAL, MANUAL] }
+        source_id: { type: string, description: 'order_id, referral_id или номер обращения' }
+        amount: { type: integer, minimum: 1 }
+        bucket:
+          type: string
+          enum: [PENDING, AVAILABLE]
+          description: PENDING — начислено, ждёт срока возврата; AVAILABLE — можно тратить
+        rules_version: { type: string }
+        available_at: { type: string, format: date-time, nullable: true, description: Когда станут доступны (для PENDING) }
+
+    ReferralConvertedPayload:
+      type: object
+      required: [referral_id, referrer_user_id, referee_user_id, qualifying_order_id, terms_version,
+                 referrer_bonus, referee_bonus, converted_at]
+      properties:
+        referral_id: { type: string, format: uuid, description: Ключ идемпотентности для потребителей }
+        referrer_user_id: { type: string }
+        referee_user_id: { type: string }
+        qualifying_order_id: { type: string }
+        terms_version:
+          type: string
+          description: Версия условий, зафиксированная при переходе по ссылке (terms_snapshot)
+        referrer_bonus: { type: integer, description: Из terms_snapshot, а не из текущих условий }
+        referee_bonus: { type: integer, description: Из terms_snapshot, а не из текущих условий }
+        converted_at: { type: string, format: date-time }

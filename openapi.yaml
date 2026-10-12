@@ -1,0 +1,255 @@
+openapi: 3.0.3
+info:
+  title: Loyalty API — баланс, начисление, списание, приглашения
+  version: 1.0.0
+  description: |
+    API сервиса лояльности. Все запросы приходят через общий API Gateway платформы,
+    который проверяет токен клиента (OIDC/JWT). Модель данных и правила — 05_Ledger/Ledger.md.
+
+    Идемпотентность:
+    - /loyalty/earn — по естественному ключу source_type + source_id (бизнес-факт);
+    - /loyalty/redeem — по заголовку Idempotency-Key (запрос клиента);
+    - /referral/invite — один код на участника, повтор возвращает тот же код.
+servers:
+  - url: https://api.platform.example/loyalty-service/v1
+security:
+  - bearerAuth: []
+
+paths:
+  /loyalty/balance:
+    get:
+      summary: Баланс участника
+      description: Баланс берётся из loyalty_account (производное от журнала значение, см. Ledger.md §2).
+      operationId: getBalance
+      responses:
+        '200':
+          description: Текущий баланс
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Balance' }
+        '404':
+          description: Счёт не найден
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /loyalty/earn:
+    post:
+      summary: Начисление баллов (сервис-сервис и back-office)
+      description: |
+        Основной путь начисления — событие PurchaseCompleted. Этот метод нужен для ручных
+        корректировок (FR-07) и резервного начисления. Идемпотентен по естественному ключу:
+        повтор с тем же source_type + source_id возвращает уже созданную операцию (200),
+        новая операция создаётся только при первом вызове (201).
+      operationId: earnPoints
+      security:
+        - serviceAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EarnRequest' }
+      responses:
+        '201':
+          description: Операция создана
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperationResult' }
+        '200':
+          description: Операция с таким source_type + source_id уже существует, возвращена она же
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperationResult' }
+        '403':
+          description: Счёт заблокирован (status = BLOCKED)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: Нарушены правила начисления (например, пустое основание для MANUAL)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /loyalty/redeem:
+    post:
+      summary: Списание баллов (оплата части заказа или обмен на сертификат)
+      description: |
+        Списание выполняется под блокировкой строки счёта (SELECT … FOR UPDATE). При одновременных
+        списаниях успешно только первое, остальные получают 409 INSUFFICIENT_POINTS с актуальным балансом.
+        Заголовок Idempotency-Key обязателен: повтор с тем же ключом и тем же телом возвращает
+        сохранённый ответ; тот же ключ с другим телом — 422 IDEMPOTENCY_KEY_MISMATCH.
+      operationId: redeemPoints
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: Уникальный ключ попытки, генерирует клиент (UUID). Хранится 24 часа.
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RedeemRequest' }
+      responses:
+        '200':
+          description: Баллы списаны (или зарезервированы для оплаты заказа)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OperationResult' }
+        '403':
+          description: Счёт ограничен (RESTRICTED при отрицательном балансе) или заблокирован
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: Недостаточно доступных баллов (в том числе проигравший в гонке списаний)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: Превышен лимит оплаты баллами 30% стоимости камня или ключ идемпотентности использован с другим телом
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /referral/invite:
+    post:
+      summary: Получить персональную ссылку-приглашение
+      description: Один код на участника. Повторный вызов возвращает тот же код и ссылку.
+      operationId: createInvite
+      responses:
+        '200':
+          description: Ссылка и код
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Invite' }
+        '403':
+          description: Приглашения отключены (referral_blocked_until в будущем)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    serviceAuth:
+      type: oauth2
+      flows:
+        clientCredentials:
+          tokenUrl: https://auth.platform.example/oauth/token
+          scopes:
+            loyalty.earn: Начисление баллов
+
+  schemas:
+    Balance:
+      type: object
+      required: [account_id, user_id, available, pending, reserved, status]
+      properties:
+        account_id: { type: string, format: uuid }
+        user_id: { type: string }
+        available:
+          type: integer
+          description: Доступные баллы. Может быть отрицательным только после EARN_CANCEL или REVERSAL
+        pending: { type: integer, minimum: 0, description: Ожидают окончания срока возврата }
+        reserved: { type: integer, minimum: 0, description: Зарезервированы под оформляемый заказ }
+        status: { $ref: '#/components/schemas/AccountStatus' }
+        referral_blocked_until: { type: string, format: date-time, nullable: true }
+        updated_at: { type: string, format: date-time }
+
+    AccountStatus:
+      type: string
+      enum: [ACTIVE, RESTRICTED, BLOCKED]
+
+    Bucket:
+      type: string
+      enum: [AVAILABLE, PENDING, RESERVED]
+
+    SourceType:
+      type: string
+      enum: [ORDER, ORDER_PAYMENT, REFUND, REFERRAL, CERTIFICATE, FRAUD_CASE, APPEAL, MANUAL]
+
+    EntryType:
+      type: string
+      enum: [EARN, EARN_CANCEL, ACTIVATE, BONUS, RESERVE, RELEASE, CAPTURE, REDEEM,
+             REFUND_POINTS, CERT_RETURN, CERT_BLOCK_CREDIT, REVERSAL, RESTORE, ADJUST]
+
+    EarnRequest:
+      type: object
+      required: [user_id, source_type, source_id, amount, bucket]
+      properties:
+        user_id: { type: string }
+        source_type:
+          allOf: [ { $ref: '#/components/schemas/SourceType' } ]
+          description: Вместе с source_id образует естественный ключ идемпотентности
+        source_id: { type: string, description: 'Например, order_id или номер обращения' }
+        amount: { type: integer, minimum: 1 }
+        bucket: { $ref: '#/components/schemas/Bucket' }
+        reason: { type: string, description: Основание; обязательно для MANUAL }
+
+    RedeemRequest:
+      type: object
+      required: [purpose, amount, reference_id]
+      properties:
+        purpose:
+          type: string
+          enum: [ORDER_PAYMENT, CERTIFICATE]
+          description: |
+            ORDER_PAYMENT — резерв под заказ (RESERVE): каждая попытка получает новый reservation_id,
+            повторный резерв по тому же заказу после 30 минут не конфликтует с прошлым.
+            CERTIFICATE — обмен на сертификат (REDEEM): запись журнала и сертификат создаются одной транзакцией.
+        amount: { type: integer, minimum: 1 }
+        reference_id:
+          type: string
+          description: order_id для ORDER_PAYMENT или id услуги из каталога для CERTIFICATE
+
+    OperationResult:
+      type: object
+      required: [operation_id, account_id, entries, balance]
+      properties:
+        operation_id: { type: string, format: uuid }
+        account_id: { type: string, format: uuid }
+        entries:
+          type: array
+          items: { $ref: '#/components/schemas/LedgerEntry' }
+        certificate_id: { type: string, format: uuid, nullable: true, description: 'Для CERTIFICATE; он же source_id записи REDEEM' }
+        reservation_id: { type: string, format: uuid, nullable: true, description: 'Для ORDER_PAYMENT; передаётся при списании (CAPTURE) или снятии резерва (RELEASE)' }
+        balance: { $ref: '#/components/schemas/Balance' }
+
+    LedgerEntry:
+      type: object
+      required: [entry_id, entry_type, bucket, amount, source_type, source_id, created_at]
+      properties:
+        entry_id: { type: string, format: uuid }
+        entry_type: { $ref: '#/components/schemas/EntryType' }
+        bucket: { $ref: '#/components/schemas/Bucket' }
+        amount: { type: integer, description: Со знаком }
+        source_type: { $ref: '#/components/schemas/SourceType' }
+        source_id: { type: string }
+        reverses_entry_id: { type: string, format: uuid, nullable: true }
+        rules_version: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+
+    Invite:
+      type: object
+      required: [code, link]
+      properties:
+        code: { type: string, example: ivan-4821 }
+        link: { type: string, format: uri, example: 'https://platform.example/r/ivan-4821' }
+        terms_version: { type: string, description: 'Действующие условия; фиксируются в реферале при переходе по ссылке' }
+
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum: [INSUFFICIENT_POINTS, ACCOUNT_RESTRICTED, ACCOUNT_BLOCKED, PAYMENT_LIMIT_EXCEEDED,
+                 IDEMPOTENCY_KEY_MISMATCH, REFERRAL_BLOCKED, VALIDATION_ERROR, NOT_FOUND]
+        message: { type: string }
+        balance:
+          allOf: [ { $ref: '#/components/schemas/Balance' } ]
+          description: Актуальный баланс (для INSUFFICIENT_POINTS)
